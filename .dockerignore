@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.env
+output/
+assets/voices/
+assets/backgrounds/
+assets/fonts/
+script.txt
+.DS_Store
