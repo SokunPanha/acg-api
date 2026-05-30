@@ -9,6 +9,24 @@ from .config import PipelineConfig, _hex_to_ass
 LogFn      = Optional[Callable[[str, str], None]]
 ProgressFn = Optional[Callable[[float, str], None]]
 
+# GPU encoding. Default forces NVIDIA NVENC; override with VIDEO_ENCODER=libx264 etc.
+VIDEO_ENCODER = os.environ.get("VIDEO_ENCODER", "h264_nvenc")
+# allow GPU→CPU fallback if the GPU/driver isn't available (set "0" to fail hard instead)
+ENCODER_FALLBACK = os.environ.get("VIDEO_ENCODER_FALLBACK", "1") != "0"
+
+
+def _encoder_args(encoder: str) -> list[str]:
+    """Codec + rate-control flags for the chosen encoder."""
+    if encoder == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+                "-rc", "vbr", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if encoder == "hevc_nvenc":
+        return ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if encoder == "h264_videotoolbox":
+        return ["-c:v", "h264_videotoolbox", "-q:v", "55", "-pix_fmt", "yuv420p"]
+    # CPU fallback / default
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+
 # sizing convention — the frontend preview MUST mirror these so preview == render
 FONT_DIVISOR    = 600    # fontPx   = height * font_size / 600
 OUTLINE_DIVISOR = 1000   # outline  = height * outline   / 1000
@@ -87,42 +105,53 @@ def render_video(
     log("Rendering video…", "info")
     progress(0.66, "Rendering…")
 
-    try:
-        cmd = _build_ffmpeg_cmd(config)
-        log("Running ffmpeg…")
+    # try the configured (GPU) encoder; fall back to CPU libx264 if the GPU isn't usable
+    encoders = [VIDEO_ENCODER]
+    if ENCODER_FALLBACK and VIDEO_ENCODER != "libx264":
+        encoders.append("libx264")
 
-        # Popen + poll so the render can be cancelled mid-encode (terminates ffmpeg)
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        while proc.poll() is None:
-            if should_cancel and should_cancel():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                log("Render cancelled.", "warn")
-                # remove the partial/corrupt output
-                if os.path.exists(config.output_path):
-                    try: os.remove(config.output_path)
-                    except OSError: pass
-                return False
-            time.sleep(0.3)
+    for i, encoder in enumerate(encoders):
+        try:
+            cmd = _build_ffmpeg_cmd(config, encoder)
+            log(f"Running ffmpeg ({encoder})…")
 
-        if proc.returncode != 0:
+            # Popen + poll so the render can be cancelled mid-encode (terminates ffmpeg)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            while proc.poll() is None:
+                if should_cancel and should_cancel():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    log("Render cancelled.", "warn")
+                    if os.path.exists(config.output_path):
+                        try: os.remove(config.output_path)
+                        except OSError: pass
+                    return False
+                time.sleep(0.3)
+
+            if proc.returncode == 0:
+                log(f"Video saved: {config.output_path}", "ok")
+                progress(1.0, "Done!")
+                return True
+
             err = (proc.stderr.read() or "")[-400:]
+            # GPU encoder failed (no GPU/driver in this environment) → try CPU next
+            if i + 1 < len(encoders):
+                log(f"{encoder} unavailable — falling back to CPU (libx264).", "warn")
+                continue
             log(f"ffmpeg error:\n{err}", "error")
             return False
 
-        log(f"Video saved: {config.output_path}", "ok")
-        progress(1.0, "Done!")
-        return True
+        except Exception as exc:
+            log(f"Error: {exc}", "error")
+            return False
 
-    except Exception as exc:
-        log(f"Error: {exc}", "error")
-        return False
+    return False
 
 
-def _build_ffmpeg_cmd(config: PipelineConfig) -> list[str]:
+def _build_ffmpeg_cmd(config: PipelineConfig, encoder: str = VIDEO_ENCODER) -> list[str]:
     w, h = config.dimensions
     is_video = config.background.endswith(".mp4")
 
@@ -156,17 +185,16 @@ def _build_ffmpeg_cmd(config: PipelineConfig) -> list[str]:
         "-map", "1:a:0",
         "-vf", vf,
         "-r", fps,
-        "-c:v", "libx264",
-        "-preset", "veryfast",      # ~5-10x faster than "slow"; minimal quality loss at same CRF
-        "-crf", "20",               # high quality (lower = better; 18 was overkill/slow)
-        "-pix_fmt", "yuv420p",
+    ]
+    cmd += _encoder_args(encoder)
+    cmd += [
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
         "-shortest",                # loop the bg video forever, but stop when the voice ends
     ]
-    # static-image backgrounds: tune for stills so bitrate isn't wasted chasing fake motion
-    if not is_video:
+    # static-image backgrounds with libx264: tune for stills (nvenc has no such tune)
+    if not is_video and encoder == "libx264":
         cmd += ["-tune", "stillimage"]
 
     cmd += [config.output_path]
