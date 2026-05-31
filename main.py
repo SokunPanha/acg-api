@@ -905,7 +905,10 @@ Rules:
 
 # ── bulk ───────────────────────────────────────────────────────────────────────
 
-BULK_TOPIC_CONCURRENCY = 2
+# Process bulk topics one at a time by default: each item runs script → voice → render,
+# and running 2+ at once overloads weaker machines (two ffmpeg renders) and triggers
+# VoxCPM rate limits. Override with BULK_TOPIC_CONCURRENCY=2 if the host can handle it.
+BULK_TOPIC_CONCURRENCY = max(1, int(os.environ.get("BULK_TOPIC_CONCURRENCY", "1")))
 _bulk_jobs: dict[str, list] = {}   # job_id → list of item state dicts
 
 

@@ -110,33 +110,44 @@ def render_video(
     if ENCODER_FALLBACK and VIDEO_ENCODER != "libx264":
         encoders.append("libx264")
 
+    # ffmpeg writes a continuous progress stream to stderr. Capturing that via
+    # subprocess.PIPE without draining it deadlocks long renders: the ~64 KB OS pipe
+    # buffer fills (after ~15 min of output), ffmpeg blocks on its next write and never
+    # exits. Redirect to a log FILE instead — it can't fill — and read its tail on error.
+    log_path = os.path.join(config.session_dir, "ffmpeg.log")
+
     for i, encoder in enumerate(encoders):
         try:
             cmd = _build_ffmpeg_cmd(config, encoder)
             log(f"Running ffmpeg ({encoder})…")
 
             # Popen + poll so the render can be cancelled mid-encode (terminates ffmpeg)
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            while proc.poll() is None:
-                if should_cancel and should_cancel():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    log("Render cancelled.", "warn")
-                    if os.path.exists(config.output_path):
-                        try: os.remove(config.output_path)
-                        except OSError: pass
-                    return False
-                time.sleep(0.3)
+            with open(log_path, "wb") as logf:
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=logf)
+                while proc.poll() is None:
+                    if should_cancel and should_cancel():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        log("Render cancelled.", "warn")
+                        if os.path.exists(config.output_path):
+                            try: os.remove(config.output_path)
+                            except OSError: pass
+                        return False
+                    time.sleep(0.3)
 
             if proc.returncode == 0:
                 log(f"Video saved: {config.output_path}", "ok")
                 progress(1.0, "Done!")
                 return True
 
-            err = (proc.stderr.read() or "")[-600:]
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    err = f.read()[-600:]
+            except OSError:
+                err = ""
             # GPU encoder failed (no GPU/driver in this environment) → try CPU next
             if i + 1 < len(encoders):
                 log(f"{encoder} failed — falling back to CPU (libx264). Reason:\n{err}", "warn")
@@ -165,7 +176,9 @@ def _build_ffmpeg_cmd(config: PipelineConfig, encoder: str = VIDEO_ENCODER) -> l
     else:
         vf = scale
 
-    cmd = ["ffmpeg", "-y"]
+    # -nostats/-loglevel keep stderr small (no per-frame progress spam), so the log file
+    # stays tiny and we still capture genuine warnings/errors for diagnostics.
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "warning", "-y"]
 
     if is_video:
         cmd += ["-stream_loop", "-1", "-i", config.background]
