@@ -136,10 +136,10 @@ def render_video(
                 progress(1.0, "Done!")
                 return True
 
-            err = (proc.stderr.read() or "")[-400:]
+            err = (proc.stderr.read() or "")[-600:]
             # GPU encoder failed (no GPU/driver in this environment) → try CPU next
             if i + 1 < len(encoders):
-                log(f"{encoder} unavailable — falling back to CPU (libx264).", "warn")
+                log(f"{encoder} failed — falling back to CPU (libx264). Reason:\n{err}", "warn")
                 continue
             log(f"ffmpeg error:\n{err}", "error")
             return False
