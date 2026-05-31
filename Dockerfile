@@ -2,7 +2,7 @@
 # CUDA runtime base so ffmpeg can use NVENC (h264_nvenc) for GPU video encoding.
 # The container toolkit mounts the host's NVIDIA driver libs at runtime; this image
 # provides the CUDA userspace that NVENC needs. (CPU still works via libx264 fallback.)
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 # ffmpeg is required by pydub (audio) and the video renderer.
 # Ubuntu's ffmpeg is built with NVENC enabled and loads libnvidia-encode at runtime.
